@@ -1407,6 +1407,24 @@ if __name__ == "__main__":
         kv("  Compliance ID:", str(compliance_id)[:12] + "...")
         print()
 
+    # Whitelist the issuer wallet so can_transfer() passes
+    # during minting (issuer -> investor) and redemption
+    # (investor -> issuer).
+    with db.transaction() as tx:
+        tx.execute(
+            "INSERT INTO whitelisted_wallets "
+            "(id, investor_id, wallet_address, tier, created_at) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (wallet_address) DO NOTHING",
+            (
+                uuid.uuid4(),
+                uuid.UUID(int=0),
+                "ISSUER_WALLET",
+                InvestorTier.INSTITUTIONAL.value,
+                datetime.now(timezone.utc),
+            )
+        )
+
     # ---- Step 4: Mint Tokens ----
     header(4, "Mint Tokens to Investor Wallets")
 
