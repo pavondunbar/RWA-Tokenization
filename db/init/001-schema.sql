@@ -97,6 +97,9 @@ CREATE TABLE state_transitions (
   from_state VARCHAR(20),
   to_state VARCHAR(20) NOT NULL,
   metadata JSONB,
+  request_id UUID,
+  trace_id UUID,
+  actor VARCHAR(256),
   created_at TIMESTAMP NOT NULL
 );
 
@@ -212,6 +215,33 @@ CREATE TRIGGER trg_outbox_published_immutable
   FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
 
 -- -----------------------------------------------
+-- DLQ tables (append-only)
+-- -----------------------------------------------
+
+CREATE TABLE outbox_publish_attempts (
+  id UUID PRIMARY KEY,
+  event_id UUID NOT NULL REFERENCES outbox_events(id),
+  error_message TEXT NOT NULL,
+  attempted_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE outbox_dlq (
+  id UUID PRIMARY KEY,
+  event_id UUID NOT NULL UNIQUE REFERENCES outbox_events(id),
+  error_message TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  created_at TIMESTAMP NOT NULL
+);
+
+CREATE TRIGGER trg_outbox_publish_attempts_immutable
+  BEFORE UPDATE OR DELETE ON outbox_publish_attempts
+  FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TRIGGER trg_outbox_dlq_immutable
+  BEFORE UPDATE OR DELETE ON outbox_dlq
+  FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+-- -----------------------------------------------
 -- Views — derived state
 -- -----------------------------------------------
 
@@ -268,13 +298,16 @@ LEFT JOIN whitelist_revocations wr
   ON wr.wallet_id = ww.id
 WHERE wr.id IS NULL;
 
--- Unpublished outbox events
+-- Unpublished outbox events (excludes dead-lettered)
 CREATE VIEW v_unpublished_events AS
 SELECT oe.*
 FROM outbox_events oe
 LEFT JOIN outbox_published op
   ON op.event_id = oe.id
-WHERE op.id IS NULL;
+LEFT JOIN outbox_dlq dlq
+  ON dlq.event_id = oe.id
+WHERE op.id IS NULL
+AND dlq.id IS NULL;
 
 -- Asset current value: initial total_value + accumulated yields
 CREATE VIEW v_asset_current_value AS

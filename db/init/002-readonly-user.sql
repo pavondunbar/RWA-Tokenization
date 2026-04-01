@@ -16,3 +16,7 @@ GRANT INSERT ON outbox_published TO readonly_user;
 
 -- The publisher reads the unpublished-events view
 GRANT SELECT ON v_unpublished_events TO readonly_user;
+
+-- DLQ tables: publisher records failed attempts and dead-letters
+GRANT SELECT, INSERT ON outbox_publish_attempts TO readonly_user;
+GRANT SELECT, INSERT ON outbox_dlq TO readonly_user;

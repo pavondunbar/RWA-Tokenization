@@ -15,10 +15,14 @@ logger = logging.getLogger(__name__)
 
 
 class OutboxPublisher:
-    def __init__(self, db, kafka_producer, batch_size=100):
+    def __init__(
+        self, db, kafka_producer,
+        batch_size=100, max_retries=5
+    ):
         self.db = db
         self.kafka = kafka_producer
         self.batch_size = batch_size
+        self.max_retries = max_retries
 
     async def poll_and_publish(self):
         async with self.db.acquire() as conn:
@@ -29,7 +33,10 @@ class OutboxPublisher:
                     "FROM outbox_events oe "
                     "LEFT JOIN outbox_published op "
                     "  ON op.event_id = oe.id "
+                    "LEFT JOIN outbox_dlq dlq "
+                    "  ON dlq.event_id = oe.id "
                     "WHERE op.id IS NULL "
+                    "AND dlq.id IS NULL "
                     "ORDER BY oe.created_at "
                     "LIMIT $1 "
                     "FOR UPDATE OF oe SKIP LOCKED",
@@ -45,19 +52,92 @@ class OutboxPublisher:
                 )
 
                 for event in events:
+                    event_id = event["id"]
+
+                    prior_attempts = await conn.fetchval(
+                        "SELECT COUNT(*) FROM "
+                        "outbox_publish_attempts "
+                        "WHERE event_id = $1",
+                        event_id,
+                    )
+
+                    if prior_attempts >= self.max_retries:
+                        await conn.execute(
+                            "INSERT INTO outbox_dlq "
+                            "(id, event_id, "
+                            " error_message, attempts, "
+                            " created_at) "
+                            "VALUES ($1,$2,$3,$4,NOW())",
+                            uuid.uuid4(),
+                            event_id,
+                            "Max retries exceeded",
+                            prior_attempts,
+                        )
+                        try:
+                            dlq_topic = (
+                                "rwa.dlq."
+                                f"{event['event_type']}"
+                            )
+                            payload = event["payload"]
+                            if not isinstance(
+                                payload, str
+                            ):
+                                payload = json.dumps(
+                                    payload
+                                )
+                            await self.kafka.send(
+                                topic=dlq_topic,
+                                key=event[
+                                    "aggregate_id"
+                                ].encode(),
+                                value=payload.encode(),
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "Event %s moved to DLQ "
+                            "after %d attempts",
+                            event_id,
+                            prior_attempts,
+                        )
+                        continue
+
                     topic = f"rwa.{event['event_type']}"
                     payload = event["payload"]
                     if not isinstance(payload, str):
                         payload = json.dumps(payload)
 
-                    await self.kafka.send(
-                        topic=topic,
-                        key=event["aggregate_id"].encode(),
-                        value=payload.encode(),
-                    )
+                    try:
+                        await self.kafka.send(
+                            topic=topic,
+                            key=event[
+                                "aggregate_id"
+                            ].encode(),
+                            value=payload.encode(),
+                        )
+                    except Exception as exc:
+                        await conn.execute(
+                            "INSERT INTO "
+                            "outbox_publish_attempts "
+                            "(id, event_id, "
+                            " error_message, "
+                            " attempted_at) "
+                            "VALUES ($1,$2,$3,NOW())",
+                            uuid.uuid4(),
+                            event_id,
+                            str(exc)[:1000],
+                        )
+                        logger.error(
+                            "Failed to publish event "
+                            "%s: %s",
+                            event_id,
+                            exc,
+                        )
+                        continue
+
                     logger.info(
                         "Published event %s -> %s",
-                        event["id"],
+                        event_id,
                         topic,
                     )
 
@@ -66,7 +146,7 @@ class OutboxPublisher:
                         "(id, event_id, published_at) "
                         "VALUES ($1, $2, NOW())",
                         uuid.uuid4(),
-                        event["id"],
+                        event_id,
                     )
 
     async def run_forever(self, poll_interval=1):

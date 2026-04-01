@@ -84,6 +84,39 @@ class KYCFailedError(Exception):
 class InsufficientTokenBalanceError(Exception):
     pass
 
+class UnauthorizedError(Exception):
+    pass
+
+
+# -----------------------------------------------
+# RBAC — Role-Based Access Control
+# -----------------------------------------------
+
+class Role(str, Enum):
+    ADMIN      = "admin"
+    SYSTEM     = "system"
+    SIGNER     = "signer"
+    COMPLIANCE = "compliance"
+
+
+class Actor:
+    def __init__(self, actor_id, role, name):
+        self.actor_id = actor_id
+        self.role = role
+        self.name = name
+
+    def __str__(self):
+        return f"{self.role.value}:{self.name}"
+
+
+def require_role(actor, *allowed_roles):
+    if actor.role not in allowed_roles:
+        raise UnauthorizedError(
+            f"Role {actor.role.value} cannot perform "
+            f"this action. Required: "
+            f"{[r.value for r in allowed_roles]}"
+        )
+
 
 # -----------------------------------------------
 # PostgresDB — Real Postgres Connection
@@ -183,14 +216,16 @@ def get_current_state(conn, entity_type, entity_id):
 
 def insert_state_transition(
     conn, entity_type, entity_id,
-    from_state, to_state, metadata=None
+    from_state, to_state, metadata=None,
+    request_id=None, trace_id=None, actor=None
 ):
     """Appends a state_transition row."""
     conn.execute(
         "INSERT INTO state_transitions "
         "(id, entity_type, entity_id, from_state, "
-        " to_state, metadata, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        " to_state, metadata, request_id, "
+        " trace_id, actor, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
             uuid.uuid4(),
             entity_type,
@@ -198,6 +233,9 @@ def insert_state_transition(
             from_state,
             to_state,
             json.dumps(metadata) if metadata else None,
+            request_id,
+            trace_id,
+            actor,
             datetime.now(timezone.utc),
         )
     )
@@ -364,8 +402,12 @@ class RWARegistry:
 
     def register_asset(
         self, asset_type, name, total_value,
-        jurisdiction, custodian, idempotency_key
+        jurisdiction, custodian, idempotency_key,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.ADMIN)
+
         existing = self.db.query(
             "SELECT * FROM rwa_assets "
             "WHERE idempotency_key = %s",
@@ -378,6 +420,8 @@ class RWARegistry:
             raise InvalidCustodianError(
                 f"Custodian {custodian} is not approved"
             )
+
+        request_id = uuid.uuid4()
 
         with self.db.transaction() as conn:
 
@@ -400,9 +444,13 @@ class RWARegistry:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'asset', asset_id,
-                None, AssetStatus.PENDING_LEGAL.value
+                None, AssetStatus.PENDING_LEGAL.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             conn.execute(
@@ -420,7 +468,11 @@ class RWARegistry:
                         "name":         name,
                         "total_value":  str(total_value),
                         "jurisdiction": jurisdiction,
-                        "custodian":    custodian
+                        "custodian":    custodian,
+                        "request_id":   str(request_id),
+                        "trace_id":     str(trace_id)
+                                        if trace_id else None,
+                        "actor":        actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -458,8 +510,14 @@ class LegalWrapperService:
 
     def create_legal_wrapper(
         self, asset_id, structure_type,
-        jurisdiction, token_supply
+        jurisdiction, token_supply,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.ADMIN)
+
+        request_id = uuid.uuid4()
+
         with self.db.transaction() as conn:
 
             asset = conn.query(
@@ -500,10 +558,14 @@ class LegalWrapperService:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'asset', asset_id,
                 AssetStatus.PENDING_LEGAL.value,
-                AssetStatus.PENDING_AUDIT.value
+                AssetStatus.PENDING_AUDIT.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             conn.execute(
@@ -520,7 +582,12 @@ class LegalWrapperService:
                         "wrapper_id":      str(wrapper_id),
                         "structure":       structure_type.value,
                         "token_supply":    str(token_supply),
-                        "price_per_token": str(price_per_token)
+                        "price_per_token": str(price_per_token),
+                        "request_id":      str(request_id),
+                        "trace_id":        str(trace_id)
+                                           if trace_id
+                                           else None,
+                        "actor":           actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -557,8 +624,12 @@ class KYCComplianceService:
     def onboard_investor(
         self, investor_id, wallet_address,
         jurisdiction, investor_tier,
-        idempotency_key
+        idempotency_key,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.COMPLIANCE)
+
         existing = self.db.query(
             "SELECT * FROM investor_compliance "
             "WHERE idempotency_key = %s",
@@ -580,6 +651,8 @@ class KYCComplianceService:
         )
         if not kyc_result.passed:
             raise KYCFailedError(kyc_result.reason)
+
+        request_id = uuid.uuid4()
 
         with self.db.transaction() as conn:
 
@@ -603,9 +676,13 @@ class KYCComplianceService:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'compliance', compliance_id,
-                None, ComplianceStatus.APPROVED.value
+                None, ComplianceStatus.APPROVED.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             conn.execute(
@@ -635,7 +712,12 @@ class KYCComplianceService:
                         "investor_id":    str(investor_id),
                         "wallet_address": wallet_address,
                         "tier":           investor_tier.value,
-                        "jurisdiction":   jurisdiction
+                        "jurisdiction":   jurisdiction,
+                        "request_id":     str(request_id),
+                        "trace_id":       str(trace_id)
+                                          if trace_id
+                                          else None,
+                        "actor":          actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -664,9 +746,17 @@ class KYCComplianceService:
         )
         return bool(sender_approved) and bool(receiver_approved)
 
-    def revoke_whitelist(self, investor_id, reason):
+    def revoke_whitelist(
+        self, investor_id, reason,
+        actor=None, trace_id=None
+    ):
         """Revokes investor whitelist status by inserting
         revocation records instead of deleting rows."""
+        if actor:
+            require_role(actor, Role.COMPLIANCE)
+
+        request_id = uuid.uuid4()
+
         with self.db.transaction() as conn:
 
             wallet = conn.query(
@@ -693,6 +783,7 @@ class KYCComplianceService:
                     )
                 )
 
+            actor_str = str(actor) if actor else None
             compliance = conn.query(
                 "SELECT id FROM investor_compliance "
                 "WHERE investor_id = %s "
@@ -704,7 +795,10 @@ class KYCComplianceService:
                     conn, 'compliance', compliance.id,
                     ComplianceStatus.APPROVED.value,
                     ComplianceStatus.EXPIRED.value,
-                    {"reason": reason}
+                    {"reason": reason},
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    actor=actor_str,
                 )
 
             conn.execute(
@@ -718,7 +812,12 @@ class KYCComplianceService:
                     "investor.whitelist_revoked",
                     json.dumps({
                         "investor_id": str(investor_id),
-                        "reason":      reason
+                        "reason":      reason,
+                        "request_id":  str(request_id),
+                        "trace_id":    str(trace_id)
+                                       if trace_id
+                                       else None,
+                        "actor":       actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -756,8 +855,12 @@ class TokenMintingService:
 
     def mint_tokens(
         self, asset_id, investor_id, wallet_address,
-        token_amount, fiat_received, idempotency_key
+        token_amount, fiat_received, idempotency_key,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.ADMIN)
+
         existing = self.db.query(
             "SELECT * FROM token_mints "
             "WHERE idempotency_key = %s",
@@ -772,6 +875,8 @@ class TokenMintingService:
             raise WalletNotWhitelistedError(
                 f"Wallet {wallet_address} is not whitelisted"
             )
+
+        request_id = uuid.uuid4()
 
         with self.db.transaction() as conn:
 
@@ -818,9 +923,13 @@ class TokenMintingService:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'mint', mint_id,
-                None, MintStatus.PENDING.value
+                None, MintStatus.PENDING.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             conn.execute(
@@ -837,7 +946,12 @@ class TokenMintingService:
                         "asset_id":      str(asset_id),
                         "wallet":        wallet_address,
                         "token_amount":  str(token_amount),
-                        "fiat_received": str(fiat_received)
+                        "fiat_received": str(fiat_received),
+                        "request_id":    str(request_id),
+                        "trace_id":      str(trace_id)
+                                         if trace_id
+                                         else None,
+                        "actor":         actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -856,10 +970,18 @@ class TokenMintingService:
 
         return mint
 
-    def confirm_mint(self, mint_id, tx_hash, block_number):
+    def confirm_mint(
+        self, mint_id, tx_hash, block_number,
+        actor=None, trace_id=None
+    ):
         """Called by ConfirmationTracker when mint transaction
         is confirmed on-chain. Records state transition and
         creates double-entry ledger entry."""
+        if actor:
+            require_role(actor, Role.SYSTEM)
+
+        request_id = uuid.uuid4()
+
         with self.db.transaction() as conn:
 
             mint_row = conn.query(
@@ -870,6 +992,7 @@ class TokenMintingService:
                 (mint_id,)
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'mint', mint_id,
                 MintStatus.PENDING.value,
@@ -877,7 +1000,10 @@ class TokenMintingService:
                 {
                     "tx_hash": tx_hash,
                     "block_number": block_number,
-                }
+                },
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             insert_ledger_entry(
@@ -906,7 +1032,12 @@ class TokenMintingService:
                     json.dumps({
                         "mint_id":      str(mint_id),
                         "tx_hash":      tx_hash,
-                        "block_number": str(block_number)
+                        "block_number": str(block_number),
+                        "request_id":   str(request_id),
+                        "trace_id":     str(trace_id)
+                                        if trace_id
+                                        else None,
+                        "actor":        actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -935,8 +1066,12 @@ class TokenRedemptionService:
 
     def request_redemption(
         self, asset_id, investor_id, wallet_address,
-        token_amount, bank_account, idempotency_key
+        token_amount, bank_account, idempotency_key,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.ADMIN)
+
         existing = self.db.query(
             "SELECT * FROM token_redemptions "
             "WHERE idempotency_key = %s",
@@ -949,6 +1084,8 @@ class TokenRedemptionService:
             wallet_address, "ISSUER_WALLET"
         ):
             raise WalletNotWhitelistedError()
+
+        request_id = uuid.uuid4()
 
         with self.db.transaction() as conn:
 
@@ -989,9 +1126,13 @@ class TokenRedemptionService:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'redemption', redemption_id,
-                None, RedemptionStatus.PENDING.value
+                None, RedemptionStatus.PENDING.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             conn.execute(
@@ -1007,7 +1148,12 @@ class TokenRedemptionService:
                         "redemption_id": str(redemption_id),
                         "asset_id":      str(asset_id),
                         "wallet":        wallet_address,
-                        "token_amount":  str(token_amount)
+                        "token_amount":  str(token_amount),
+                        "request_id":    str(request_id),
+                        "trace_id":      str(trace_id)
+                                         if trace_id
+                                         else None,
+                        "actor":         actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -1027,9 +1173,17 @@ class TokenRedemptionService:
 
         return redemption_id
 
-    def settle_redemption(self, redemption_id):
+    def settle_redemption(
+        self, redemption_id,
+        actor=None, trace_id=None
+    ):
         """Called after burn is confirmed on-chain.
         Wires fiat back to investor bank account."""
+        if actor:
+            require_role(actor, Role.SYSTEM)
+
+        request_id = uuid.uuid4()
+
         with self.db.transaction() as conn:
 
             redemption = conn.query(
@@ -1046,10 +1200,14 @@ class TokenRedemptionService:
                     f"Expected burned, got {current}"
                 )
 
+            actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'redemption', redemption_id,
                 RedemptionStatus.BURNED.value,
-                RedemptionStatus.SETTLED.value
+                RedemptionStatus.SETTLED.value,
+                request_id=request_id,
+                trace_id=trace_id,
+                actor=actor_str,
             )
 
             insert_ledger_entry(
@@ -1083,7 +1241,12 @@ class TokenRedemptionService:
                         "bank_account":  redemption.bank_account,
                         "token_amount":  str(
                             redemption.token_amount
-                        )
+                        ),
+                        "request_id":    str(request_id),
+                        "trace_id":      str(trace_id)
+                                         if trace_id
+                                         else None,
+                        "actor":         actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -1119,8 +1282,12 @@ class NAVCalculationEngine:
         self.signing_queue = signing_queue
 
     def calculate_and_distribute_yield(
-        self, asset_id, annual_yield_rate, idempotency_key
+        self, asset_id, annual_yield_rate, idempotency_key,
+        actor=None, trace_id=None
     ):
+        if actor:
+            require_role(actor, Role.SYSTEM)
+
         existing = self.db.query(
             "SELECT * FROM nav_calculations "
             "WHERE idempotency_key = %s",
@@ -1128,6 +1295,8 @@ class NAVCalculationEngine:
         )
         if existing:
             return existing
+
+        request_id = uuid.uuid4()
 
         with self.db.transaction() as conn:
 
@@ -1166,6 +1335,7 @@ class NAVCalculationEngine:
                 )
             )
 
+            actor_str = str(actor) if actor else None
             conn.execute(
                 "INSERT INTO outbox_events "
                 "(id, aggregate_id, event_type, payload, "
@@ -1179,7 +1349,12 @@ class NAVCalculationEngine:
                         "asset_id":    str(asset_id),
                         "nav_id":      str(nav_id),
                         "daily_yield": str(daily_yield),
-                        "yield_rate":  str(annual_yield_rate)
+                        "yield_rate":  str(annual_yield_rate),
+                        "request_id":  str(request_id),
+                        "trace_id":    str(trace_id)
+                                       if trace_id
+                                       else None,
+                        "actor":       actor_str,
                     }),
                     datetime.now(timezone.utc),
                 )
@@ -1282,12 +1457,17 @@ class RWAOutboxPublisher:
     Uses LEFT JOIN outbox_published to find unpublished
     events. Marks publication by inserting into
     outbox_published instead of updating outbox_events.
+    Routes permanently failed events to a dead letter queue.
     """
 
-    def __init__(self, db, kafka_producer, batch_size=100):
+    def __init__(
+        self, db, kafka_producer,
+        batch_size=100, max_retries=5
+    ):
         self.db = db
         self.kafka = kafka_producer
         self.batch_size = batch_size
+        self.max_retries = max_retries
 
     def poll_and_publish(self):
         """Poll unpublished outbox events and send to Kafka.
@@ -1302,7 +1482,10 @@ class RWAOutboxPublisher:
                     "FROM outbox_events oe "
                     "LEFT JOIN outbox_published op "
                     "  ON op.event_id = oe.id "
+                    "LEFT JOIN outbox_dlq dlq "
+                    "  ON dlq.event_id = oe.id "
                     "WHERE op.id IS NULL "
+                    "AND dlq.id IS NULL "
                     "ORDER BY oe.created_at "
                     "LIMIT %s "
                     "FOR UPDATE OF oe SKIP LOCKED",
@@ -1313,23 +1496,99 @@ class RWAOutboxPublisher:
 
                 for row in rows:
                     event = dict(zip(cols, row))
+                    event_id = event["id"]
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM "
+                        "outbox_publish_attempts "
+                        "WHERE event_id = %s",
+                        (event_id,)
+                    )
+                    prior_attempts = cur.fetchone()[0]
+
+                    if prior_attempts >= self.max_retries:
+                        cur.execute(
+                            "INSERT INTO outbox_dlq "
+                            "(id, event_id, error_message,"
+                            " attempts, created_at) "
+                            "VALUES (%s,%s,%s,%s,NOW())",
+                            (
+                                uuid.uuid4(),
+                                event_id,
+                                "Max retries exceeded",
+                                prior_attempts,
+                            )
+                        )
+                        try:
+                            dlq_topic = (
+                                "rwa.dlq."
+                                f"{event['event_type']}"
+                            )
+                            payload = event["payload"]
+                            if isinstance(payload, dict):
+                                payload = json.dumps(
+                                    payload
+                                )
+                            self.kafka.send(
+                                topic=dlq_topic,
+                                key=event[
+                                    "aggregate_id"
+                                ].encode(),
+                                value=payload.encode(),
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "Event %s moved to DLQ "
+                            "after %d attempts",
+                            event_id,
+                            prior_attempts,
+                        )
+                        continue
+
                     payload = event["payload"]
                     if isinstance(payload, dict):
                         payload = json.dumps(payload)
 
-                    self.kafka.send(
-                        topic=f"rwa.{event['event_type']}",
-                        key=(
-                            event["aggregate_id"].encode()
-                        ),
-                        value=payload.encode(),
-                    )
+                    try:
+                        self.kafka.send(
+                            topic=(
+                                f"rwa.{event['event_type']}"
+                            ),
+                            key=(
+                                event[
+                                    "aggregate_id"
+                                ].encode()
+                            ),
+                            value=payload.encode(),
+                        )
+                    except Exception as exc:
+                        cur.execute(
+                            "INSERT INTO "
+                            "outbox_publish_attempts "
+                            "(id, event_id, "
+                            " error_message, "
+                            " attempted_at) "
+                            "VALUES (%s,%s,%s,NOW())",
+                            (
+                                uuid.uuid4(),
+                                event_id,
+                                str(exc)[:1000],
+                            )
+                        )
+                        logger.error(
+                            "Failed to publish event "
+                            "%s: %s",
+                            event_id,
+                            exc,
+                        )
+                        continue
 
                     cur.execute(
                         "INSERT INTO outbox_published "
                         "(id, event_id, published_at) "
                         "VALUES (%s, %s, NOW())",
-                        (uuid.uuid4(), event["id"])
+                        (uuid.uuid4(), event_id)
                     )
                     published += 1
 
@@ -1477,10 +1736,23 @@ if __name__ == "__main__":
     )
     outbox_publisher = RWAOutboxPublisher(db, kafka_producer)
 
+    # -- RBAC actors for the demo --
+    admin_actor = Actor(
+        uuid.uuid4(), Role.ADMIN, "demo-admin"
+    )
+    system_actor = Actor(
+        uuid.uuid4(), Role.SYSTEM, "rwa-service"
+    )
+    compliance_actor = Actor(
+        uuid.uuid4(), Role.COMPLIANCE, "kyc-service"
+    )
+    demo_trace_id = uuid.uuid4()
+
     print("\n" + "#" * 60)
     print("#  RWA Tokenization — Postgres + Kafka")
     print("#  Modeled after BlackRock BUIDL ($2.9B T-Bill Fund)")
     print("#  Append-Only Ledger | Double-Entry Accounting")
+    print("#  RBAC | Audit Trails | Dead Letter Queue")
     print("#" * 60)
 
     # ---- Step 1: Register Asset ----
@@ -1498,6 +1770,8 @@ if __name__ == "__main__":
         jurisdiction="Delaware, United States",
         custodian=custodian_name,
         idempotency_key=f"register-{asset_id}",
+        actor=admin_actor,
+        trace_id=demo_trace_id,
     )
 
     asset_id = asset.id
@@ -1507,6 +1781,7 @@ if __name__ == "__main__":
     kv("Total Value:", f"${total_value:,.2f}")
     kv("Custodian:", custodian_name)
     kv("Status:", AssetStatus.PENDING_LEGAL.value)
+    kv("Actor:", str(admin_actor))
 
     # ---- Step 2: Create Legal Wrapper ----
     header(2, "Create Legal Wrapper (Delaware Trust)")
@@ -1517,6 +1792,8 @@ if __name__ == "__main__":
         structure_type=LegalStructure.TRUST,
         jurisdiction="Delaware, United States",
         token_supply=token_supply,
+        actor=admin_actor,
+        trace_id=demo_trace_id,
     )
 
     price_per_token = total_value / Decimal(str(token_supply))
@@ -1525,6 +1802,7 @@ if __name__ == "__main__":
     kv("Token Supply:", f"{token_supply:,}")
     kv("Price Per Token:", f"${price_per_token:.2f}")
     kv("Asset Status:", AssetStatus.PENDING_AUDIT.value)
+    kv("Actor:", str(admin_actor))
 
     # ---- Step 3: Onboard Investors ----
     header(3, "Onboard Investors (KYC/AML)")
@@ -1534,12 +1812,16 @@ if __name__ == "__main__":
         insert_state_transition(
             tx, 'asset', asset_id,
             AssetStatus.PENDING_AUDIT.value,
-            AssetStatus.APPROVED.value
+            AssetStatus.APPROVED.value,
+            actor=str(admin_actor),
+            trace_id=demo_trace_id,
         )
         insert_state_transition(
             tx, 'asset', asset_id,
             AssetStatus.APPROVED.value,
-            AssetStatus.TOKENIZED.value
+            AssetStatus.TOKENIZED.value,
+            actor=str(admin_actor),
+            trace_id=demo_trace_id,
         )
 
     investors = [
@@ -1560,6 +1842,8 @@ if __name__ == "__main__":
             jurisdiction="United States",
             investor_tier=InvestorTier.INSTITUTIONAL,
             idempotency_key=f"onboard-{investor_id}",
+            actor=compliance_actor,
+            trace_id=demo_trace_id,
         )
         investor_records.append(
             (name, investor_id, wallet, amount,
@@ -1574,6 +1858,7 @@ if __name__ == "__main__":
            ComplianceStatus.APPROVED.value)
         kv("  Compliance ID:",
            str(compliance_id)[:12] + "...")
+        kv("  Actor:", str(compliance_actor))
         print()
 
     # Whitelist the issuer wallet
@@ -1606,6 +1891,8 @@ if __name__ == "__main__":
             token_amount=token_amount,
             fiat_received=amount,
             idempotency_key=f"mint-{inv_id}",
+            actor=admin_actor,
+            trace_id=demo_trace_id,
         )
         mint_records.append(
             (name, inv_id, wallet, token_amount, mint)
@@ -1614,6 +1901,7 @@ if __name__ == "__main__":
         kv("  Tokens Minted:", f"{token_amount:,}")
         kv("  Fiat Received:", f"${amount:,.2f}")
         kv("  Mint Status:", MintStatus.PENDING.value)
+        kv("  Actor:", str(admin_actor))
         print()
 
     reserved = get_reserved_supply(db, asset_id)
@@ -1631,6 +1919,8 @@ if __name__ == "__main__":
         asset_id=asset_id,
         annual_yield_rate=annual_rate,
         idempotency_key=f"nav-{asset_id}-day1",
+        actor=system_actor,
+        trace_id=demo_trace_id,
     )
 
     kv("Annual Yield Rate:", "5.00%")
@@ -1678,6 +1968,8 @@ if __name__ == "__main__":
         gs_mint.id,
         tx_hash="0x" + uuid.uuid4().hex,
         block_number=19_000_000,
+        actor=system_actor,
+        trace_id=demo_trace_id,
     )
 
     redemption_id = redemption_svc.request_redemption(
@@ -1687,6 +1979,8 @@ if __name__ == "__main__":
         token_amount=redeem_amount,
         bank_account="CHASE-WIRE-****7890",
         idempotency_key=f"redeem-{gs_id}",
+        actor=admin_actor,
+        trace_id=demo_trace_id,
     )
 
     fiat_out = Decimal(str(redeem_amount)) * price_per_token
