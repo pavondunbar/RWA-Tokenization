@@ -1,5 +1,7 @@
 # Real World Asset (RWA) Tokenization System (Python)
 
+<img width="1536" height="1024" alt="873a6360-a86a-4b83-abc3-90a28c4cd317" src="https://github.com/user-attachments/assets/7bf99454-7d2e-447d-9357-8a3d4066e833" />
+
 > **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
 > This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not legally reviewed, and must not be used to tokenize, manage, or transfer real assets or investor capital.** See the [Production Warning](#-production-warning) section for full details.
 
