@@ -1,6 +1,7 @@
-.PHONY: up down demo logs db-balances db-ledger db-audit \
-       db-states db-outbox db-dlq db-tables db-immutable-test \
-       shell-pg topics test help
+.PHONY: up down build restart ps demo logs db-balances db-ledger \
+       db-audit db-states db-outbox db-dlq db-tables \
+       db-immutable-test shell-pg shell-kafka topics kafka-tail \
+       health test help
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -15,6 +16,19 @@ up: ## Build and start all services
 
 down: ## Stop containers and remove volumes (full reset)
 	docker compose down -v
+
+build: ## Build images without starting containers
+	docker compose build
+
+restart: ## Restart all services without rebuilding
+	docker compose restart
+
+ps: ## Show container status and health
+	docker compose ps
+
+health: ## Show health status of all containers
+	@docker compose ps --format \
+	  "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
 
 # ---------------------------------------------------------------------------
 # Demo & Logs
@@ -110,6 +124,15 @@ shell-pg: ## Open an interactive psql shell
 topics: ## List Kafka topics
 	docker exec rwa-kafka kafka-topics \
 	  --bootstrap-server localhost:9092 --list
+
+kafka-tail: ## Consume messages from all rwa.* topics
+	docker exec rwa-kafka kafka-console-consumer \
+	  --bootstrap-server localhost:9092 \
+	  --whitelist 'rwa\..*' \
+	  --from-beginning --timeout-ms 10000
+
+shell-kafka: ## Open an interactive shell in the Kafka container
+	docker exec -it rwa-kafka bash
 
 # ---------------------------------------------------------------------------
 # Tests

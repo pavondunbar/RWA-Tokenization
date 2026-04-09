@@ -534,6 +534,10 @@ make help          # Show all available targets
 |---|---|
 | `make up` | Build and start all services (`docker compose up --build -d`) |
 | `make down` | Stop containers and remove volumes (full reset) |
+| `make build` | Build images without starting containers |
+| `make restart` | Restart all services without rebuilding |
+| `make ps` | Show container status and health |
+| `make health` | Show health status of all containers |
 
 ### Demo & Logs
 
@@ -556,11 +560,18 @@ make help          # Show all available targets
 | `make db-immutable-test` | Verify append-only triggers reject mutations |
 | `make shell-pg` | Open an interactive `psql` shell |
 
-### Kafka & Testing
+### Kafka
 
 | Command | Description |
 |---|---|
 | `make topics` | List Kafka topics |
+| `make kafka-tail` | Consume messages from all `rwa.*` topics |
+| `make shell-kafka` | Open an interactive shell in the Kafka container |
+
+### Testing
+
+| Command | Description |
+|---|---|
 | `make test` | Run integration tests (requires `make up` first) |
 
 ---
@@ -929,7 +940,7 @@ docker-compose logs -f
 ```
 RWA-PYTHON/
 │
-├── Makefile                       # make up / down / demo / logs / db-balances / test
+├── Makefile                       # Lifecycle, DB inspection, Kafka, and test targets
 ├── docker-compose.yaml            # Full stack: DB, Kafka, services, signing
 ├── rwa-tokenization.py            # Host-runnable demo (all service classes)
 ├── rwa-tokenization.sql           # PostgreSQL schema (tables + indexes)
