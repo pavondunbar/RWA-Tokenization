@@ -1,5 +1,6 @@
 import uuid
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 from enum import Enum
@@ -1680,6 +1681,26 @@ if __name__ == "__main__":
             for d in details:
                 print(f"    {d}")
 
+    class SimulatedBlockchain:
+        """Generates realistic Ethereum tx hashes and
+        incrementing block numbers for demo output."""
+
+        def __init__(self, starting_block=19_000_000):
+            self._block = starting_block
+            self._tx_index = 0
+
+        def submit_tx(self, operation, payload=""):
+            """Simulate submitting a transaction. Returns
+            (tx_hash, block_number)."""
+            self._tx_index += 1
+            raw = f"{operation}:{payload}:{self._tx_index}"
+            tx_hash = (
+                "0x"
+                + hashlib.sha256(raw.encode()).hexdigest()
+            )
+            self._block += 1
+            return tx_hash, self._block
+
     # -- Helpers --
 
     def header(step, title):
@@ -1718,6 +1739,7 @@ if __name__ == "__main__":
     blockchain_svc = StubBlockchainService(db)
     custodian_api = StubCustodianAPI(db)
     alert_service = StubAlertService()
+    chain = SimulatedBlockchain(starting_block=19_000_000)
 
     registry = RWARegistry(db, None)
     legal_svc = LegalWrapperService(db)
@@ -1775,12 +1797,17 @@ if __name__ == "__main__":
     )
 
     asset_id = asset.id
+    deploy_tx, deploy_block = chain.submit_tx(
+        "deploy_asset_contract", str(asset_id)
+    )
     kv("Asset ID:", str(asset_id)[:12] + "...")
     kv("Name:", asset_name)
     kv("Type:", AssetType.FUND.value)
     kv("Total Value:", f"${total_value:,.2f}")
     kv("Custodian:", custodian_name)
     kv("Status:", AssetStatus.PENDING_LEGAL.value)
+    kv("Deploy Tx Hash:", deploy_tx[:18] + "...")
+    kv("Block Number:", f"{deploy_block:,}")
     kv("Actor:", str(admin_actor))
 
     # ---- Step 2: Create Legal Wrapper ----
@@ -1797,11 +1824,16 @@ if __name__ == "__main__":
     )
 
     price_per_token = total_value / Decimal(str(token_supply))
+    token_tx, token_block = chain.submit_tx(
+        "deploy_token_contract", str(wrapper_id)
+    )
     kv("Wrapper ID:", str(wrapper_id)[:12] + "...")
     kv("Structure:", LegalStructure.TRUST.value)
     kv("Token Supply:", f"{token_supply:,}")
     kv("Price Per Token:", f"${price_per_token:.2f}")
     kv("Asset Status:", AssetStatus.PENDING_AUDIT.value)
+    kv("Token Contract Tx:", token_tx[:18] + "...")
+    kv("Block Number:", f"{token_block:,}")
     kv("Actor:", str(admin_actor))
 
     # ---- Step 3: Onboard Investors ----
@@ -1845,6 +1877,9 @@ if __name__ == "__main__":
             actor=compliance_actor,
             trace_id=demo_trace_id,
         )
+        wl_tx, wl_block = chain.submit_tx(
+            "whitelist_wallet", wallet
+        )
         investor_records.append(
             (name, investor_id, wallet, amount,
              compliance_id)
@@ -1858,6 +1893,8 @@ if __name__ == "__main__":
            ComplianceStatus.APPROVED.value)
         kv("  Compliance ID:",
            str(compliance_id)[:12] + "...")
+        kv("  Whitelist Tx:", wl_tx[:18] + "...")
+        kv("  Block Number:", f"{wl_block:,}")
         kv("  Actor:", str(compliance_actor))
         print()
 
@@ -1894,13 +1931,25 @@ if __name__ == "__main__":
             actor=admin_actor,
             trace_id=demo_trace_id,
         )
+        mint_tx, mint_block = chain.submit_tx(
+            "mint_tokens", f"{inv_id}:{token_amount}"
+        )
+        mint_svc.confirm_mint(
+            mint.id,
+            tx_hash=mint_tx,
+            block_number=mint_block,
+            actor=system_actor,
+            trace_id=demo_trace_id,
+        )
         mint_records.append(
             (name, inv_id, wallet, token_amount, mint)
         )
         kv(f"{name}:", "")
         kv("  Tokens Minted:", f"{token_amount:,}")
         kv("  Fiat Received:", f"${amount:,.2f}")
-        kv("  Mint Status:", MintStatus.PENDING.value)
+        kv("  Mint Tx Hash:", mint_tx[:18] + "...")
+        kv("  Block Number:", f"{mint_block:,}")
+        kv("  Mint Status:", MintStatus.CONFIRMED.value)
         kv("  Actor:", str(admin_actor))
         print()
 
@@ -1923,9 +1972,14 @@ if __name__ == "__main__":
         trace_id=demo_trace_id,
     )
 
+    rebase_tx, rebase_block = chain.submit_tx(
+        "rebase_yield", str(nav_id)
+    )
     kv("Annual Yield Rate:", "5.00%")
     kv("Daily Yield Rate:", f"{daily_rate * 100:.5f}%")
     kv("Fund Daily Yield:", f"${daily_yield:,.2f}")
+    kv("Rebase Tx Hash:", rebase_tx[:18] + "...")
+    kv("Block Number:", f"{rebase_block:,}")
     print()
     print("  Per-Investor Daily Yield:")
     for name, _, _, amount, _ in investor_records:
@@ -1951,6 +2005,7 @@ if __name__ == "__main__":
     kv("Internal NAV:", f"${current_value:,.2f}")
     kv("Custodian NAV:", f"${custodian_nav:,.2f}")
     kv("NAV Match:", "YES" if result else "NO")
+    kv("Verified At Block:", f"{chain._block:,}")
     kv("Reconciliation:", "PASSED" if result else "FAILED")
 
     # ---- Step 7: Redemption ----
@@ -1960,17 +2015,6 @@ if __name__ == "__main__":
         investor_records[2]
     )
     redeem_amount = 5_000_000
-
-    # Confirm the mint first so the redemption balance
-    # check finds confirmed ledger entries.
-    gs_mint = mint_records[2][4]
-    mint_svc.confirm_mint(
-        gs_mint.id,
-        tx_hash="0x" + uuid.uuid4().hex,
-        block_number=19_000_000,
-        actor=system_actor,
-        trace_id=demo_trace_id,
-    )
 
     redemption_id = redemption_svc.request_redemption(
         asset_id=asset_id,
@@ -1983,11 +2027,16 @@ if __name__ == "__main__":
         trace_id=demo_trace_id,
     )
 
+    burn_tx, burn_block = chain.submit_tx(
+        "burn_tokens", f"{gs_id}:{redeem_amount}"
+    )
     fiat_out = Decimal(str(redeem_amount)) * price_per_token
     kv("Investor:", gs_name)
     kv("Tokens Redeemed:", f"{redeem_amount:,}")
     kv("Fiat Returned:", f"${fiat_out:,.2f}")
     kv("Wire Destination:", "CHASE-WIRE-****7890")
+    kv("Burn Tx Hash:", burn_tx[:18] + "...")
+    kv("Block Number:", f"{burn_block:,}")
     kv("Redemption Status:",
        RedemptionStatus.PENDING.value)
     kv("Redemption ID:",
@@ -2028,6 +2077,7 @@ if __name__ == "__main__":
     print(f"  Reserved Supply: {reserved:,.0f}")
     print(f"  Confirmed Supply:{confirmed_supply:,.0f}")
     print(f"  Fund NAV:        ${current_value:,.2f}")
+    print(f"  Latest Block:    {chain._block:,}")
     print(f"  Outbox Events:   {total_events.cnt}")
     print(f"  Kafka Published: {published}")
     print(f"{'=' * 60}\n")
